@@ -124,6 +124,7 @@ module lpt_class
      procedure :: collide                                !< Evaluate interparticle collision force
      procedure :: advance                                !< Step forward the particle ODEs
      procedure :: get_rhs                                !< Compute rhs of particle odes
+     procedure :: get_lift                               !< Compute acceleration due to lift
      procedure :: resize                                 !< Resize particle array to given size
      procedure :: resize_ghost                           !< Resize ghost array to given size
      procedure :: recycle                                !< Recycle particle array by removing flagged particles
@@ -652,6 +653,7 @@ contains
     real(WP), dimension(3) :: acc,torque,dmom
     real(WP), dimension(this%cfg%imino_:this%cfg%imaxo_,this%cfg%jmino_:this%cfg%jmaxo_,this%cfg%kmino_:this%cfg%kmaxo_) :: sx,sy,sz
     type(part) :: myp,pold
+    logical :: compute_lift
 
     ! Zero out source term arrays
     if (present(srcU)) srcU=0.0_WP
@@ -674,7 +676,11 @@ contains
       sz=stress_z
     else
       sz=0.0_WP
-    end if
+   end if
+
+   ! Decide if we should compute lift
+   compute_lift=.false.
+   if (present(vortx).and.present(vorty).and.present(vortz)) compute_lift=.true.
 
     ! Zero out number of particles removed
     this%np_out=0
@@ -696,11 +702,13 @@ contains
           Ip = 0.1_WP*myp%d**2
           ! Advance with Euler prediction
           call this%get_rhs(U=U,V=V,W=W,rho=rho,visc=visc,stress_x=sx,stress_y=sy,stress_z=sz,p=myp,acc=acc,torque=torque,opt_dt=myp%dt)
+          if (compute_lift) call this%get_lift(vortx=vortx,vorty=vorty,vortz=vortz,U=U,V=V,W=W,visc=visc,rho=rho,p=myp,acc=acc)
           myp%pos=pold%pos+0.5_WP*mydt*myp%vel
           myp%vel=pold%vel+0.5_WP*mydt*(acc+this%gravity+myp%Acol)
           myp%angVel=pold%angVel+0.5_WP*mydt*(torque+myp%Tcol)/Ip
           ! Correct with midpoint rule
           call this%get_rhs(U=U,V=V,W=W,rho=rho,visc=visc,stress_x=sx,stress_y=sy,stress_z=sz,p=myp,acc=acc,torque=torque,opt_dt=myp%dt)
+          if (compute_lift) call this%get_lift(vortx=vortx,vorty=vorty,vortz=vortz,U=U,V=V,W=W,visc=visc,rho=rho,p=myp,acc=acc)
           myp%pos=pold%pos+mydt*myp%vel
           myp%vel=pold%vel+mydt*(acc+this%gravity+myp%Acol)
           myp%angVel=pold%angVel+mydt*(torque+myp%Tcol)/Ip
@@ -789,7 +797,8 @@ contains
     real(WP), dimension(3), intent(out) :: acc,torque
     real(WP), intent(out) :: opt_dt
     real(WP) :: fvisc,frho,pVF,fVF,fT
-    real(WP), dimension(3) :: fvel,fstress,fvort
+    real(WP) :: Re,tau,corr,b1,b2
+    real(WP), dimension(3) :: fvel,fstress
 
     ! Interpolate fluid quantities to particle location
     interpolate: block
@@ -809,64 +818,80 @@ contains
       if (present(T)) fT=this%cfg%get_scalar(pos=p%pos,i0=p%ind(1),j0=p%ind(2),k0=p%ind(3),S=T,bc='n')
     end block interpolate
 
-    ! Compute acceleration due to drag
-    compute_drag: block
-      real(WP) :: Re,tau,corr,b1,b2
-      ! Particle Reynolds number
-      Re=frho*norm2(p%vel-fvel)*p%d/fvisc+epsilon(1.0_WP)
-      ! Drag correction
-      select case(trim(this%drag_model))
-      case('None','none')
-         corr=epsilon(1.0_WP)
-      case('Stokes')
-         corr=1.0_WP
-      case('Schiller-Naumann','Schiller Naumann','SN')
-         corr=1.0_WP+0.15_WP*Re**(0.687_WP)
-      case('Tenneti')
-         ! Tenneti and Subramaniam (2011)
-         b1=5.81_WP*pVF/fVF**3+0.48_WP*pVF**(1.0_WP/3.0_WP)/fVF**4
-         b2=pVF**3*Re*(0.95_WP+0.61_WP*pVF**3/fVF**2)
-         corr=fVF*(1.0_WP+0.15_WP*Re**(0.687_WP)/fVF**3+b1+b2)           
-      case('Khalloufi Capecelatro','KC')
-         !> Todo
-      case default
-         corr=1.0_WP
-      end select
-      ! Particle response time
-      tau=this%rho*p%d**2/(18.0_WP*fvisc*corr)
-      ! Return acceleration and optimal timestep size
-      acc=(fvel-p%vel)/tau+fstress/this%rho
-      opt_dt=tau/real(this%nstep,WP)
-    end block compute_drag
+    ! Particle Reynolds number
+    Re=frho*norm2(p%vel-fvel)*p%d/fvisc+epsilon(1.0_WP)
+    ! Drag correction
+    select case(trim(this%drag_model))
+    case('None','none')
+       corr=epsilon(1.0_WP)
+    case('Stokes')
+       corr=1.0_WP
+    case('Schiller-Naumann','Schiller Naumann','SN')
+       corr=1.0_WP+0.15_WP*Re**(0.687_WP)
+    case('Tenneti')
+       ! Tenneti and Subramaniam (2011)
+       b1=5.81_WP*pVF/fVF**3+0.48_WP*pVF**(1.0_WP/3.0_WP)/fVF**4
+       b2=pVF**3*Re*(0.95_WP+0.61_WP*pVF**3/fVF**2)
+       corr=fVF*(1.0_WP+0.15_WP*Re**(0.687_WP)/fVF**3+b1+b2)           
+    case('Khalloufi Capecelatro','KC')
+       !> Todo
+    case default
+       corr=1.0_WP
+    end select
+    ! Particle response time
+    tau=this%rho*p%d**2/(18.0_WP*fvisc*corr)
+    ! Return acceleration and optimal timestep size
+    acc=(fvel-p%vel)/tau+fstress/this%rho
+    opt_dt=tau/real(this%nstep,WP)
 
-    ! Compute acceleration due to Saffman lift
-    !compute_lift: block
-   !   use mathtools, only: Pi,cross_product
-   !   real(WP) :: omegag,Cl,Reg
-   !   if (this%use_lift) then
-   !      omegag=sqrt(sum(fvort**2))
-   !      if (omegag.gt.0.0_WP) then
-   !         Reg = p%d**2*omegag*frho/fvisc
-   !         Cl = 9.69_WP/Pi/p%d**2/this%rho*fvisc/omegag*sqrt(Reg)
-   !         acc=acc+Cl*cross_product(fvel-p%vel,fvort)
-   !      end if
-   !   end if
-    !end block compute_lift
-
-    ! Compute fluid torque (assumed Stokes drag)
-    compute_torque: block
-      torque=0.0_WP!6.0_WP*fvisc*(0.5_WP*fvort-p%angVel)/this%rho
-    end block compute_torque
-
-    ! Compute heat transfer
-    compute_heat_transfer: block
-      !> Todo
-    end block compute_heat_transfer
+    torque=0.0_WP
 
   end subroutine get_rhs
 
 
-  !> Update particle volume fraction using our current particles
+  !> Calculate lift force
+  subroutine get_lift(this,vortx,vorty,vortz,U,V,W,visc,rho,p,acc)
+    use mathtools, only: Pi,cross_product
+    implicit none
+    class(lpt), intent(inout) :: this
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: U         !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: V         !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: W         !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: vortx     !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: vorty     !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: vortz     !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: rho       !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: visc      !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+    type(part), intent(in) :: p
+    real(WP), dimension(3), intent(out) :: acc
+    real(WP) :: frho,fvisc,omegag,Reg,Cl
+    real(WP), dimension(3) :: fvel,fvort
+
+    ! Interpolate fluid quantities to particle location
+    interpolate: block
+      ! Interpolate the fluid phase velocity to the particle location
+      fvel=this%cfg%get_velocity(pos=p%pos,i0=p%ind(1),j0=p%ind(2),k0=p%ind(3),U=U,V=V,W=W)
+      ! Interpolate the fluid phase velocity to the particle location
+      fvort=this%cfg%get_velocity(pos=p%pos,i0=p%ind(1),j0=p%ind(2),k0=p%ind(3),U=vortx,V=vorty,W=vortz)
+      ! Interpolate the fluid phase viscosity to the particle location
+      fvisc=this%cfg%get_scalar(pos=p%pos,i0=p%ind(1),j0=p%ind(2),k0=p%ind(3),S=visc,bc='n')
+      fvisc=fvisc+epsilon(1.0_WP)
+      ! Interpolate the fluid phase density to the particle location
+      frho=this%cfg%get_scalar(pos=p%pos,i0=p%ind(1),j0=p%ind(2),k0=p%ind(3),S=rho,bc='n')
+    end block interpolate
+
+    ! Compute acceleration due to Saffman lift
+    omegag=sqrt(sum(fvort**2))
+    if (omegag.gt.0.0_WP) then
+       Reg = p%d**2*omegag*frho/fvisc
+       Cl = 9.69_WP/Pi/p%d**2/this%rho*fvisc/omegag*sqrt(Reg)
+       acc=acc+Cl*cross_product(fvel-p%vel,fvort)
+    end if
+
+  end subroutine get_lift
+
+
+!> Update particle volume fraction using our current particles
   subroutine update_VF(this)
     use mathtools, only: Pi
     implicit none
@@ -1845,3 +1870,4 @@ contains
 
 
 end module lpt_class
+
